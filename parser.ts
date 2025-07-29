@@ -5,7 +5,7 @@ const tokenize = (input: string) =>
     .split(/\r?\n/)
     .map((line) => line.replace(/("(?:\\.|[^"\\])*")|;.*/g, (_, s) => s ?? ""))
     .join(" ")
-    .match(/[()]|'|"(?:\\.|[^"\\])*"|[^\s()]+/g) || [];
+    .match(/[()\[\]]|'|"(?:\\.|[^"\\])*"|[^\s()\[\]]+/g) || [];
 
 const parseAtom = (token: string) => {
   if (/^\d+$/.test(token)) return parseInt(token, 10);
@@ -15,8 +15,9 @@ const parseAtom = (token: string) => {
 
 const parseList = (tokens: string[], acc: AST[] = []): [AST[], string[]] => {
   if (tokens.length === 0) throw new Error("Unexpected EOF while reading list");
+  const token = tokens.at(-1);
 
-  if (tokens.at(-1) === ")") {
+  if (token && "])".includes(token)) {
     return [acc, (tokens.pop(), tokens)];
   } else {
     const [form, nextTokens] = parseForm(tokens);
@@ -27,7 +28,7 @@ const parseList = (tokens: string[], acc: AST[] = []): [AST[], string[]] => {
 const parseForm = (tokens: string[]): [AST, string[]] => {
   const token = tokens.pop();
 
-  if (token === "(") {
+  if (token && "[(".includes(token)) {
     return parseList(tokens);
   } else if (token === "'") {
     const [form, nextTokens] = parseForm(tokens);
