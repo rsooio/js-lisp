@@ -4,12 +4,12 @@ const tokenize = (input: string) =>
   input
     .split(/\r?\n/)
     .map((line) => line.replace(/("(?:\\.|[^"\\])*")|;.*/g, (_, s) => s ?? ""))
-    .join(" ")
+    .join("\n")
     .match(/[()\[\]]|'|"(?:\\.|[^"\\])*"|[^\s()\[\]]+/g) || [];
 
 const parseAtom = (token: string) => {
   if (/^\d+$/.test(token)) return parseInt(token, 10);
-  if (/^["'].*["']$/.test(token)) return token.slice(1, -1);
+  if (/^".*"$/s.test(token)) return JSON.parse(token.replaceAll("\n", "\\n"));
   return Symbol.for(token);
 };
 
