@@ -1,4 +1,5 @@
 import type { AST, Env, Eval } from "./type.js";
+import * as _ from "es-toolkit/compat";
 
 function error(message: string) {
   throw new Error(message);
@@ -6,6 +7,10 @@ function error(message: string) {
 
 function isKeyword(sym: symbol) {
   return sym.description?.startsWith("#:");
+}
+
+function getKeywordName(sym: symbol) {
+  return sym.description!.slice(2);
 }
 
 const eval_ =
@@ -87,6 +92,10 @@ const evalArgs = (args: AST[], asts: AST[]): [symbol, AST][] => {
   return [...pairs, ...kwPairs];
 };
 
+const begin = (env: Env, ...body: AST[]) => {
+  return body.reduce(async (acc, cur) => acc.then(() => eval_(env)(cur)), Promise.resolve());
+};
+
 const lambda = (env: Env, argNames: symbol[], ...body: AST[]) => {
   return async (callEnv: Env, ...args: any[]) => {
     const localEnv = Object.create(env);
@@ -94,7 +103,7 @@ const lambda = (env: Env, argNames: symbol[], ...body: AST[]) => {
     await pairs.reduce((acc, [sym, ast]) => {
       return acc.then(async () => (localEnv[sym] = await eval_(callEnv)(ast)));
     }, Promise.resolve());
-    return body.reduce(async (acc, cur) => acc.then(() => eval_(localEnv)(cur)), Promise.resolve());
+    return begin(localEnv, ...body);
   };
 };
 
@@ -102,6 +111,7 @@ const createEnv = <const T extends Record<string, any>>(env: T): Env =>
   Object.fromEntries(Object.entries(env).map(([k, v]) => [Symbol.for(k), v]));
 
 const baseEnv = createEnv({
+  JS: { String, Number },
   "#t": true,
   "#f": false,
   null: [],
@@ -110,13 +120,11 @@ const baseEnv = createEnv({
   cdr: fn((x: any[]) => x.slice(1)),
   cond: async (env: Env, clauses: AST[][]) => {
     for (const [cond, ...body] of clauses) {
-      if (cond === Symbol.for("else") || (await eval_(env)(cond!))) {
-        return body.reduce(async (acc, cur) => acc.then(() => eval_(env)(cur)), Promise.resolve());
-      }
+      if (cond === Symbol.for("else") || (await eval_(env)(cond!))) return begin(env, ...body);
     }
   },
   eval: async (env: Env, ast: AST) => eval_(env)(await eval_(env)(ast)),
-  begin: (env: Env, asts: AST[]) => lambda(env, [], ...asts)(env),
+  begin,
   lambda,
   λ: lambda,
   define: async (env: Env, names: symbol[] | symbol, ...body: AST[]) => {
@@ -152,6 +160,67 @@ const baseEnv = createEnv({
   not: fn((arg: any) => !arg),
   display: fn(console.log),
   sleep: fn((ms: number) => new Promise((resolve) => setTimeout(resolve, ms))),
+  when: async (env: Env, cond: AST, ...body: AST[]) => {
+    if (await eval_(env)(cond)) return begin(env, ...body);
+  },
+  unless: async (env: Env, cond: AST, ...body: AST[]) => {
+    if (!(await eval_(env)(cond))) return begin(env, ...body);
+  },
+  while: async (env: Env, cond: AST, ...body: AST[]) => {
+    while (await eval_(env)(cond)) {
+      await begin(env, ...body);
+    }
+  },
+  if: async (env: Env, cond: AST, thenBranch: AST, elseBranch?: AST) => {
+    if (await eval_(env)(cond)) {
+      return begin(env, thenBranch);
+    } else if (elseBranch !== undefined) {
+      return begin(env, elseBranch);
+    }
+  },
+  dict: (env: Env, ...pairs: AST[]) => {
+    if (pairs.length % 2 !== 0) throw new Error("dict requires even number of arguments");
+    return pairs.reduce(async (acc, cur, i) => {
+      return acc.then(async (obj) => {
+        if (i % 2 === 1) return obj;
+        const key = typeof cur === "symbol" && isKeyword(cur) ? getKeywordName(cur) : await eval_(env)(cur);
+        const value = await eval_(env)(pairs[i + 1]!);
+        if (key in obj) throw new Error(`Duplicate key '${key}' in dict`);
+        if (typeof key !== "string" && typeof key !== "number") throw new Error(`Invalid key type: ${typeof key}`);
+        return Object.assign(obj, { [key]: value });
+      });
+    }, Promise.resolve({}));
+  },
+  get: fn((target: any, ...path: string[]) => {
+    if (path.some((v) => !["string", "number"].includes(typeof v))) throw new Error("Path must be string or number");
+    const paths = _.toPath(path.join("."));
+    if (paths.length === 0) return target;
+    const result: unknown = _.get(target, paths);
+    if (typeof result !== "function") return result;
+    return result.bind(paths.length > 1 ? _.get(target, paths.slice(0, -1)) : target);
+  }),
+  set: fn((target: any, ...args: string[]) => {
+    if (args.length < 1) throw new Error("set requires at least two arguments");
+    const path = args.slice(0, -1);
+    if (path.some((v) => !["string", "number"].includes(typeof v))) throw new Error("Path must be string or number");
+    const paths = _.toPath(path.join("."));
+    if (paths.length === 0) return target;
+    return _.set(target, paths, args[args.length - 1]);
+  }),
+  "set!": async (env: Env, arg: AST, ...args: AST[]) => {
+    if (args.length < 1) throw new Error("set requires at least two arguments");
+    if (typeof arg !== "symbol") throw new Error("set's first argument must be a symbol");
+    const [sym, ...paths] = [..._.toPath(arg.description!), ...(await Promise.all(args.slice(0, -1).map(eval_(env))))];
+    const key = Symbol.for(sym);
+    const value = await eval_(env)(args[args.length - 1]);
+    let proto = env;
+    while (proto) {
+      if (Object.hasOwn(proto, key)) break;
+      proto = Object.getPrototypeOf(proto);
+    }
+    proto ??= env;
+    return _.set(proto, [Symbol.for(sym), ...paths], value);
+  },
 });
 
 export const newEval = (env: Record<string, any> = {}) => eval_(Object.assign(Object.create(baseEnv), createEnv(env)));

@@ -10,7 +10,9 @@ const tokenize = (input: string) =>
 const parseAtom = (token: string) => {
   if (/^\d+$/.test(token)) return parseInt(token, 10);
   if (/^".*"$/s.test(token)) return JSON.parse(token.replaceAll("\n", "\\n"));
-  return Symbol.for(token);
+  if (!token.includes(".")) return Symbol.for(token);
+  const index = token.indexOf(".");
+  return [Symbol.for("get"), Symbol.for(token.slice(0, index)), token.slice(index + 1)];
 };
 
 const parseList = (tokens: string[], acc: AST[] = []): [AST[], string[]] => {
