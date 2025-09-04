@@ -1,5 +1,7 @@
-import type { AST, Env, Eval } from "./type.js";
+import type { AST, Env, Eval, Proc } from "./type.js";
 import * as _ from "es-toolkit/compat";
+
+const TYPE: unique symbol = Symbol("type");
 
 function error(message: string) {
   throw new Error(message);
@@ -22,15 +24,27 @@ const eval_ =
     }
     if (!Array.isArray(ast)) return ast;
     if (ast[0] === undefined) throw new Error("Unexpected empty list");
-    const fn = await eval_(env)(ast[0]);
-    if (typeof fn !== "function") throw new Error(`Not a function: ${fn}`);
-    return fn(env, ...ast.slice(1));
+    const first = await eval_(env)(ast[0]);
+    if (typeof first !== "function") throw new Error(`Not a function: ${first}`);
+    const proc = TYPE in first ? first : fn(first);
+    return proc(env, ...ast.slice(1));
   };
 
 export const fn =
   <T extends (...args: any[]) => any>(f: T) =>
   async (env: Env, ...args: Parameters<T>): Promise<ReturnType<T>> =>
     f(...(await Promise.all(args.map(eval_(env)))));
+
+const withTag =
+  <Tag extends string>(tag: Tag) =>
+  <T>(val: T): T & { [TYPE]: Tag } =>
+    Object.defineProperties(val, {
+      [TYPE]: { value: tag, writable: false, enumerable: false, configurable: false },
+    }) as T & { [TYPE]: Tag };
+
+export const defineMacro = withTag("macro")<Proc>;
+export const defineProc = <T extends (...args: any[]) => any>(f: T): Proc =>
+  withTag("proc")(async (env, ...args) => f(...(await Promise.all(args.map(eval_(env))))));
 
 const evalArgs = (args: AST[], asts: AST[]): [symbol, AST][] => {
   type Arg = symbol | [symbol, AST];
@@ -92,20 +106,31 @@ const evalArgs = (args: AST[], asts: AST[]): [symbol, AST][] => {
   return [...pairs, ...kwPairs];
 };
 
-const begin = (env: Env, ...body: AST[]) => {
-  return body.reduce(async (acc, cur) => acc.then(() => eval_(env)(cur)), Promise.resolve());
-};
+const begin = defineMacro((env, ...body) =>
+  body.reduce(async (acc, cur) => acc.then(() => eval_(env)(cur)), Promise.resolve())
+);
 
-const lambda = (env: Env, argNames: symbol[], ...body: AST[]) => {
-  return async (callEnv: Env, ...args: any[]) => {
+const lambda = defineMacro((env, argNames, ...body) =>
+  withTag("proc")(async (callEnv: Env, ...args: any[]) => {
     const localEnv = Object.create(env);
-    const pairs = evalArgs(argNames, args);
+    const pairs = evalArgs(argNames as symbol[], args);
     await pairs.reduce((acc, [sym, ast]) => {
       return acc.then(async () => (localEnv[sym] = await eval_(callEnv)(ast)));
     }, Promise.resolve());
     return begin(localEnv, ...body);
+  })
+);
+
+const callback = defineMacro((env, argNames, ...body: AST[]) => {
+  const localEnv = Object.create(env);
+  return async (...args: any[]) => {
+    if (args.length !== (argNames as symbol[]).length) throw new Error("Invalid number of arguments");
+    await (argNames as symbol[]).reduce((acc, sym, i) => {
+      return acc.then(async () => (localEnv[sym] = await eval_(env)(args[i])));
+    }, Promise.resolve());
+    return body.reduce(async (acc, cur) => acc.then(() => eval_(localEnv)(cur)), Promise.resolve());
   };
-};
+});
 
 const createEnv = <const T extends Record<string, any>>(env: T): Env =>
   Object.fromEntries(Object.entries(env).map(([k, v]) => [Symbol.for(k), v]));
@@ -115,70 +140,62 @@ const baseEnv = createEnv({
   "#t": true,
   "#f": false,
   null: [],
-  quote: (_: Env, x: any) => x,
-  car: fn((x: any[]) => x[0]),
-  cdr: fn((x: any[]) => x.slice(1)),
-  cond: async (env: Env, clauses: AST[][]) => {
-    for (const [cond, ...body] of clauses) {
+  quote: defineMacro((_, x) => x),
+  car: (x: any[]) => x[0],
+  cdr: (x: any[]) => x.slice(1),
+  cond: defineMacro(async (env, clauses) => {
+    for (const [cond, ...body] of clauses as AST[][]) {
       if (cond === Symbol.for("else") || (await eval_(env)(cond!))) return begin(env, ...body);
     }
-  },
-  eval: async (env: Env, ast: AST) => eval_(env)(await eval_(env)(ast)),
+  }),
+  eval: defineMacro(async (env: Env, ast: AST) => eval_(env)(await eval_(env)(ast))),
   begin,
   lambda,
   λ: lambda,
-  define: async (env: Env, names: symbol[] | symbol, ...body: AST[]) => {
+  callback,
+  define: defineMacro(async (env, names, ...body) => {
     if (!Array.isArray(names)) {
-      env[names] = await eval_(env)(body[0]!);
+      env[names as symbol] = await eval_(env)(body[0]!);
     } else {
-      const [name, ...argNames] = names;
+      const [name, ...argNames] = names as symbol[];
       env[name!] = lambda(env, argNames, ...body);
     }
-  },
-  object: fn((...args: any[]) => Object.fromEntries(args)),
-  list: fn((...args: any[]) => args),
-  cons: fn((x: any, y: any) => [x, ...y]),
-  "object-ref": fn((obj: any, ...keys: string[]) => {
-    return keys.reduce((acc, key) => {
-      if (typeof acc[key] === "function") return acc[key].bind(acc);
-      return acc[key];
-    }, obj);
   }),
-  "null?": fn((x: any) => Array.isArray(x) && x.length === 0),
-  call: fn(async (fn: any, ...args: any[]) => fn?.(...args)),
-  "+": fn((...args: number[]) => args.reduce((prev, curr) => +prev + +curr, 0)),
-  "-": fn((...args: number[]) => args.reduce((prev, curr) => +prev - +curr)),
-  "*": fn((...args: number[]) => args.reduce((prev, curr) => +prev * +curr, 1)),
-  "/": fn((...args: number[]) => args.reduce((prev, curr) => +prev / +curr)),
-  "=": fn((a: any, b: any) => a === b),
-  ">": fn((a: any, b: any) => a > b),
-  ">=": fn((a: any, b: any) => +a >= +b),
-  "<": fn((a: any, b: any) => +a < +b),
-  "<=": fn((a: any, b: any) => +a <= +b),
-  and: fn((...args: any[]) => args.every(Boolean)),
-  or: fn((...args: any[]) => args.some(Boolean)),
-  not: fn((arg: any) => !arg),
-  display: fn(console.log),
-  sleep: fn((ms: number) => new Promise((resolve) => setTimeout(resolve, ms))),
-  when: async (env: Env, cond: AST, ...body: AST[]) => {
+  list: Array.of,
+  cons: (x: any, y: any) => [x, ...y],
+  "null?": (x: any) => Array.isArray(x) && x.length === 0,
+  call: (fn: any, ...args: any[]) => fn?.(...args),
+  "+": (...args: number[]) => args.reduce((prev, curr) => +prev + +curr, 0),
+  "-": (...args: number[]) => args.reduce((prev, curr) => +prev - +curr),
+  "*": (...args: number[]) => args.reduce((prev, curr) => +prev * +curr, 1),
+  "/": (...args: number[]) => args.reduce((prev, curr) => +prev / +curr),
+  "=": (a: any, b: any) => a === b,
+  "equal?": _.isEqual,
+  ">": (a: any, b: any) => a > b,
+  ">=": (a: any, b: any) => +a >= +b,
+  "<": (a: any, b: any) => +a < +b,
+  "<=": (a: any, b: any) => +a <= +b,
+  and: (...args: any[]) => args.every(Boolean),
+  or: (...args: any[]) => args.some(Boolean),
+  not: (arg: any) => !arg,
+  display: console.log,
+  sleep: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
+  when: defineMacro(async (env, cond, ...body) => {
     if (await eval_(env)(cond)) return begin(env, ...body);
-  },
-  unless: async (env: Env, cond: AST, ...body: AST[]) => {
-    if (!(await eval_(env)(cond))) return begin(env, ...body);
-  },
-  while: async (env: Env, cond: AST, ...body: AST[]) => {
+  }),
+  while: defineMacro(async (env, cond, ...body) => {
     while (await eval_(env)(cond)) {
       await begin(env, ...body);
     }
-  },
-  if: async (env: Env, cond: AST, thenBranch: AST, elseBranch?: AST) => {
+  }),
+  if: defineMacro(async (env, cond, thenBranch, elseBranch) => {
     if (await eval_(env)(cond)) {
       return begin(env, thenBranch);
     } else if (elseBranch !== undefined) {
       return begin(env, elseBranch);
     }
-  },
-  dict: (env: Env, ...pairs: AST[]) => {
+  }),
+  dict: defineMacro((env, ...pairs) => {
     if (pairs.length % 2 !== 0) throw new Error("dict requires even number of arguments");
     return pairs.reduce(async (acc, cur, i) => {
       return acc.then(async (obj) => {
@@ -190,37 +207,29 @@ const baseEnv = createEnv({
         return Object.assign(obj, { [key]: value });
       });
     }, Promise.resolve({}));
-  },
-  get: fn((target: any, ...path: string[]) => {
-    if (path.some((v) => !["string", "number"].includes(typeof v))) throw new Error("Path must be string or number");
+  }),
+  get: (target: any, ...path: string[]) => {
     const paths = _.toPath(path.join("."));
     if (paths.length === 0) return target;
     const result: unknown = _.get(target, paths);
     if (typeof result !== "function") return result;
     return result.bind(paths.length > 1 ? _.get(target, paths.slice(0, -1)) : target);
-  }),
-  set: fn((target: any, ...args: string[]) => {
-    if (args.length < 1) throw new Error("set requires at least two arguments");
-    const path = args.slice(0, -1);
-    if (path.some((v) => !["string", "number"].includes(typeof v))) throw new Error("Path must be string or number");
+  },
+  set: (target: any, value: any, ...path: string[]) => {
     const paths = _.toPath(path.join("."));
     if (paths.length === 0) return target;
-    return _.set(target, paths, args[args.length - 1]);
-  }),
-  "set!": async (env: Env, arg: AST, ...args: AST[]) => {
-    if (args.length < 1) throw new Error("set requires at least two arguments");
-    if (typeof arg !== "symbol") throw new Error("set's first argument must be a symbol");
-    const [sym, ...paths] = [..._.toPath(arg.description!), ...(await Promise.all(args.slice(0, -1).map(eval_(env))))];
-    const key = Symbol.for(sym);
-    const value = await eval_(env)(args[args.length - 1]);
+    return _.set(target, paths, value);
+  },
+  "set!": defineMacro(async (env, ...args) => {
+    const [value, key] = await Promise.all(args.map(eval_(env)));
     let proto = env;
     while (proto) {
       if (Object.hasOwn(proto, key)) break;
       proto = Object.getPrototypeOf(proto);
     }
     proto ??= env;
-    return _.set(proto, [Symbol.for(sym), ...paths], value);
-  },
+    return _.set(proto, Symbol.for(key), value);
+  }),
 });
 
 export const newEval = (env: Record<string, any> = {}) => eval_(Object.assign(Object.create(baseEnv), createEnv(env)));
