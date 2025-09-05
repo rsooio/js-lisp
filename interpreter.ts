@@ -23,16 +23,28 @@ const eval_ =
     }
     if (!Array.isArray(ast)) return ast;
     if (ast[0] === undefined) throw new Error("Unexpected empty list");
-    const first = await eval_(env)(ast[0]);
-    if (typeof first !== "function") throw new Error(`Not a function: ${first}`);
-    const proc = TYPE in first ? first : fn(first);
-    return proc(env, ...ast.slice(1));
+    const proc = await eval_(env)(ast[0]);
+    if (typeof proc !== "function") throw new Error(`Not a function: ${proc}`);
+    if (TYPE in proc) return proc(env, ...ast.slice(1));
+    const args = await Promise.all(ast.slice(1).map(eval_(env)).map(wrap()));
+    console.log(proc, args, ast.slice(1));
+    return proc(...args);
+    // return first(...(await Promise.all(ast.slice(1).map(eval_(env)).map(wrap()))));
   };
 
-export const fn =
-  <T extends (...args: any[]) => any>(f: T) =>
-  async (env: Env, ...args: Parameters<T>): Promise<ReturnType<T>> =>
-    f(...(await Promise.all(args.map(eval_(env)))));
+const wrap =
+  (argMap: Env = {}) =>
+  <T>(proc: T) => {
+    if (typeof proc !== "function" || !(TYPE in proc)) return proc;
+    argMap[TYPE] = "callback";
+    return async (...args: any[]) => {
+      try {
+        return await proc(argMap, ...args);
+      } catch (e) {
+        console.log("Error in callback:", e);
+      }
+    };
+  };
 
 const withTag =
   <Tag extends string>(tag: Tag) =>
@@ -42,8 +54,6 @@ const withTag =
     }) as T & { [TYPE]: Tag };
 
 export const defineMacro = withTag("macro")<Proc>;
-export const defineProc = <T extends (...args: any[]) => any>(f: T): Proc =>
-  withTag("proc")(async (env, ...args) => f(...(await Promise.all(args.map(eval_(env))))));
 
 const begin = defineMacro((env, ...body) =>
   body.reduce(async (acc, cur) => acc.then(() => eval_(env)(cur)), Promise.resolve())
@@ -94,19 +104,27 @@ const lambda = defineMacro(async (env, argNames, ...body) => {
   });
 });
 
-const toCallback = defineMacro(async (env, procArc, ...args) => {
+const toCallback = defineMacro(async (env, procArg, ...args) => {
   const map = { [TYPE]: "callback" as const } as Record<symbol, any>;
   for (const [k, v] of _.chunk(args, 2)) {
     map[k as symbol] = await eval_(env)(v);
   }
-  return async (...args: any[]) => (await eval_(env)(procArc))(map, ...args);
+  return async (...args: any[]) => {
+    const proc = await eval_(env)(procArg);
+    if (typeof proc !== "function") throw new Error(`Not a function: ${proc}`);
+    try {
+      return TYPE in proc ? await proc(map, ...args) : await proc(...args);
+    } catch (e) {
+      console.log("Error in callback:", e);
+    }
+  };
 });
 
 const createEnv = <const T extends Record<string, any>>(env: T): Env =>
   Object.fromEntries(Object.entries(env).map(([k, v]) => [Symbol.for(k), v]));
 
 const baseEnv = createEnv({
-  JS: { String, Number },
+  JS: { String, Number, Array, Boolean, Math, Date, RegExp },
   "#t": true,
   "#f": false,
   null: [],
