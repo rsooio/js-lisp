@@ -1,5 +1,5 @@
-import { REST, TYPE } from "./const";
-import type { Arg, AST, Env, Eval, Proc } from "./type";
+import { ELSE, REST, TYPE } from "./const";
+import type { Arg, AST, Env, Eval, Proc, ProcCPS } from "./type";
 import * as _ from "es-toolkit/compat";
 
 function error(message: string) {
@@ -14,38 +14,6 @@ function getKeywordName(sym: symbol) {
   return sym.description!.slice(1);
 }
 
-const eval_ =
-  (env: Env = {}): Eval =>
-  async (ast) => {
-    if (typeof ast === "symbol") {
-      if (isKeyword(ast)) throw new Error(`Keyword cannot be evaluate: ${ast.description}`);
-      return ast in env ? env[ast] : error(`Undefined symbol: ${ast.description}`);
-    }
-    if (!Array.isArray(ast)) return ast;
-    if (ast[0] === undefined) throw new Error("Unexpected empty list");
-    const proc = await eval_(env)(ast[0]);
-    if (typeof proc !== "function") throw new Error(`Not a function: ${proc}`);
-    if (TYPE in proc) return proc(env, ...ast.slice(1));
-    const args = await Promise.all(ast.slice(1).map(eval_(env)).map(wrap()));
-    console.log(proc, args, ast.slice(1));
-    return proc(...args);
-    // return first(...(await Promise.all(ast.slice(1).map(eval_(env)).map(wrap()))));
-  };
-
-const wrap =
-  (argMap: Env = {}) =>
-  <T>(proc: T) => {
-    if (typeof proc !== "function" || !(TYPE in proc)) return proc;
-    argMap[TYPE] = "callback";
-    return async (...args: any[]) => {
-      try {
-        return await proc(argMap, ...args);
-      } catch (e) {
-        console.log("Error in callback:", e);
-      }
-    };
-  };
-
 const withTag =
   <Tag extends string>(tag: Tag) =>
   <T>(val: T): T & { [TYPE]: Tag } =>
@@ -53,72 +21,141 @@ const withTag =
       [TYPE]: { value: tag, writable: false, enumerable: false, configurable: false },
     }) as T & { [TYPE]: Tag };
 
-export const defineMacro = withTag("macro")<Proc>;
+const macro = (proc: (env: Env, args: any, cont: (val: any) => void) => void) =>
+  withTag("macro")((env: Env, args: any, cont?: (val: any) => void) => proc(env, args, cont ?? ((v) => v)));
 
-const begin = defineMacro((env, ...body) =>
-  body.reduce(async (acc, cur) => acc.then(() => eval_(env)(cur)), Promise.resolve())
-);
-
-const lambda = defineMacro(async (env, argNames, ...body) => {
-  if (!Array.isArray(argNames)) throw new Error("Lambda arg names must be an array");
-
-  const parseArg = async (arg: AST): Promise<Arg> => {
-    if (typeof arg === "symbol") return [arg, undefined];
-    if (!Array.isArray(arg)) throw new Error(`Unexpected type in arg define: ${typeof arg}`);
-    return [arg[0] as symbol, await eval_(env)(arg[1])];
-  };
-
-  const parseArgs = async ([arg, ...rest]: AST[], args: Arg[] = [], map: Map<symbol, Arg> = new Map()) => {
-    if (arg === undefined) return [args, map] as const;
-    if (typeof arg !== "symbol" || !isKeyword(arg)) return parseArgs(rest, [...args, await parseArg(arg)], map);
-    if (map.has(arg)) throw new Error(`Duplicated keyword arguments: ${arg.description}`);
-    return parseArgs(rest.slice(1), args, map.set(arg, await parseArg(rest[0])));
-  };
-
-  const [defArr, defMap] = await parseArgs(argNames);
-
-  return withTag("proc")(async (callEnv: Env, ...args: AST[]) => {
-    const localEnv = Object.create(env);
-    const isCallback = callEnv[TYPE] === "callback";
-    const argMap = new Map<symbol, AST>();
-
-    args.reverse();
-    for (const [i, def] of defArr.entries()) {
-      if (def[0] === REST) {
-        args.reverse();
-        localEnv[defArr[i + 1][0]] = isCallback ? args : await Promise.all(args.map(eval_(callEnv)));
-        break;
-      }
-      const arg = args.pop();
-      if (typeof arg === "symbol" && isKeyword(arg)) argMap.set(arg, args.pop()!);
-      else if (isCallback) localEnv[def[0]] = arg ?? def[1];
-      else localEnv[def[0]] = (await eval_(callEnv)(arg!)) ?? (def[1] && (await eval_(callEnv)(def[1])));
-    }
-
-    for (const [keyword, [key, val]] of defMap.entries()) {
-      if (isCallback) localEnv[key] = callEnv[keyword] ?? val;
-      else localEnv[key] = argMap.has(keyword) ? await eval_(callEnv)(argMap.get(keyword)!) : val;
-    }
-
-    return begin(localEnv, ...body);
+// @ts-ignore
+const eval_ = macro((env, ast, cont) => {
+  if (typeof ast === "symbol") {
+    if (isKeyword(ast)) throw new Error(`Keyword cannot be evaluate: ${ast.description}`);
+    if (ast in env) return cont(env[ast]);
+    throw new Error(`Undefined symbol: ${ast.description}`);
+  }
+  if (!Array.isArray(ast)) return cont(ast);
+  if (ast[0] === undefined) throw new Error("Unexpected empty list");
+  eval_(env, ast[0]!, async (proc: ProcCPS<any[]>) => {
+    if (typeof proc !== "function") throw new Error(`Not a function: ${proc}`);
+    if (TYPE in proc) return proc(env, ast.slice(1), cont);
+    // TODO: auto wrap callback functions
+    console.log("CALL", proc, ast.slice(1));
+    const args = await Promise.all(ast.slice(1).map((arg) => wrap(env, [arg])));
+    return cont(await (proc as any)(...args));
   });
 });
 
-const toCallback = defineMacro(async (env, procArg, ...args) => {
-  const map = { [TYPE]: "callback" as const } as Record<symbol, any>;
-  for (const [k, v] of _.chunk(args, 2)) {
-    map[k as symbol] = await eval_(env)(v);
-  }
-  return async (...args: any[]) => {
-    const proc = await eval_(env)(procArg);
-    if (typeof proc !== "function") throw new Error(`Not a function: ${proc}`);
-    try {
-      return TYPE in proc ? await proc(map, ...args) : await proc(...args);
-    } catch (e) {
-      console.log("Error in callback:", e);
-    }
-  };
+const wrap = macro((env, [procAst, argMap = {}]: [AST, Env], cont) => {
+  eval_(env, procAst, (proc) => {
+    if (typeof proc !== "function" || !(TYPE in proc)) return cont(proc);
+    argMap[TYPE] = "callback";
+    return cont((...args: any[]) => {
+      try {
+        return proc(argMap, args);
+      } catch (e) {
+        console.log("Error in callback:", e);
+      }
+    });
+  });
 });
+
+// const wrap =
+//   (env: Env, argMap: Env = {}) =>
+//   (procAst: AST) => {
+//     const proc = eval_(env)(procAst);
+//     if (typeof proc !== "function" || !(TYPE in proc)) return proc;
+//     argMap[TYPE] = "callback";
+//     return (...args: any[]) => {
+//       try {
+//         return proc(argMap, ...args);
+//       } catch (e) {
+//         console.log("Error in callback:", e);
+//       }
+//     };
+//   };
+
+export const defineMacro = withTag("macro")<Proc>;
+
+const begin = macro((env, [body, ...rest]: AST[], cont) => {
+  eval_(env, body, rest.length ? undefined : cont);
+  begin(env, rest, cont);
+});
+
+const lambda = macro((env, [argNames, ...body]: AST[], cont) => {
+  if (!Array.isArray(argNames)) throw new Error("Lambda arg names must be an array");
+
+  const parseArg = (arg: AST, cont: (val: Arg) => any): void => {
+    if (typeof arg === "symbol") return cont([arg, undefined]);
+    if (!Array.isArray(arg)) throw new Error(`Unexpected type in arg define: ${typeof arg}`);
+    return cont([arg[0] as symbol, eval_(env, arg[1])]);
+  };
+
+  const parseArgs = (
+    [arg, ...rest]: AST[],
+    args: Arg[],
+    map: Map<symbol, Arg>,
+    cont: (val: [Arg[], Map<symbol, Arg>]) => any
+  ): void => {
+    if (arg === undefined) return cont([args, map]);
+    if (typeof arg !== "symbol" || !isKeyword(arg))
+      return parseArg(arg, (parsed) => parseArgs(rest, [...args, parsed], map, cont));
+    if (map.has(arg)) throw new Error(`Duplicated keyword arguments: ${arg.description}`);
+    parseArg(rest[0], (parsed) => parseArgs(rest.slice(1), args, map.set(arg, parsed), cont));
+  };
+
+  return parseArgs(argNames, [], new Map(), ([defArr, defMap]) =>
+    cont(
+      macro((callEnv, args: AST[], cont) => {
+        console.log(argNames, args);
+        const localEnv = Object.create(env);
+        const isCallback = callEnv[TYPE] === "callback";
+        const argMap = new Map<symbol, AST>();
+        let chain = Promise.resolve();
+
+        // const evalChain: typeof eval_ = (e, a, c) => {
+        //   chain = chain.then(() => new Promise((res) => eval_(e, a, (v) => (c?.(v), res()))));
+        // };
+
+        const evalChain = macro((e, a, c) => {
+          chain = chain.then(() => new Promise((res) => eval_(e, a, (v) => (c(v), res()))));
+        });
+
+        args.reverse();
+        for (const [i, def] of defArr.entries()) {
+          if (def[0] === REST) {
+            args.reverse();
+            localEnv[defArr[i + 1][0]] = isCallback ? args : args.map((arg) => evalChain(callEnv, arg));
+            if (isCallback) localEnv[defArr[i + 1][0]] = args;
+            else evalChain(callEnv, args, (vals) => (localEnv[defArr[i + 1][0]] = vals));
+            break;
+          }
+          const arg = args.pop();
+          if (typeof arg === "symbol" && isKeyword(arg)) argMap.set(arg, args.pop()!);
+          else if (isCallback) localEnv[def[0]] = arg ?? def[1];
+          else
+            evalChain(callEnv, arg, (v) => {
+              if (v !== undefined) localEnv[def[0]] = v;
+              else if (def[1] !== undefined) evalChain(callEnv, def[1], (v2) => (localEnv[def[0]] = v2));
+            });
+        }
+
+        for (const [keyword, [key, val]] of defMap.entries()) {
+          if (isCallback) localEnv[key] = callEnv[keyword] ?? val;
+          else if (argMap.has(keyword)) evalChain(callEnv, argMap.get(keyword)!, (v) => (localEnv[key] = v));
+          else localEnv[key] = val;
+        }
+
+        return chain.then(() => begin(localEnv, body, cont));
+      })
+    )
+  );
+});
+
+// const toCallback = defineMacro((env, procArg, ...args) => {
+//   const map = { [TYPE]: "callback" as const } as Record<symbol, any>;
+//   for (const [k, v] of _.chunk(args, 2)) {
+//     map[k as symbol] = eval_(env)(v);
+//   }
+//   return wrap(env, map)(procArg);
+// });
 
 const createEnv = <const T extends Record<string, any>>(env: T): Env =>
   Object.fromEntries(Object.entries(env).map(([k, v]) => [Symbol.for(k), v]));
@@ -128,26 +165,31 @@ const baseEnv = createEnv({
   "#t": true,
   "#f": false,
   null: [],
-  quote: defineMacro((_, x) => x),
+  quote: macro((_, [ast], cont) => cont(ast)),
   car: (x: any[]) => x[0],
   cdr: (x: any[]) => x.slice(1),
-  cond: defineMacro(async (env, clauses) => {
+  cond: macro(async (env, [clauses]: AST[], cont) => {
     for (const [cond, ...body] of clauses as AST[][]) {
-      if (cond === Symbol.for("else") || (await eval_(env)(cond!))) return begin(env, ...body);
+      if (cond === ELSE || (await eval_(env, cond))) return begin(env, body, cont);
     }
+    cont(undefined);
   }),
-  eval: defineMacro(async (env: Env, ast: AST) => eval_(env)(await eval_(env)(ast))),
+  eval: macro((env, ast, cont) => eval_(env, ast, (ast) => eval_(env, ast, cont))),
   begin,
   lambda,
   λ: lambda,
-  function: toCallback,
-  define: defineMacro(async (env, names, ...body) => {
+  // function: toCallback,
+  define: macro((env, [names, ...body], cont) => {
     if (!Array.isArray(names)) {
-      env[names as symbol] = await eval_(env)(body[0]!);
+      env[names as symbol] = eval_(env, body[0]!, (v) => (env[names as symbol] = v));
     } else {
       const [name, ...argNames] = names as symbol[];
-      env[name!] = lambda(env, argNames, ...body);
+      env[name] = lambda(env, [argNames, ...body], (v) => {
+        env[name] = v;
+        console.log(env);
+      });
     }
+    cont(undefined);
   }),
   list: Array.of,
   cons: (x: any, y: any) => [x, ...y],
@@ -168,34 +210,40 @@ const baseEnv = createEnv({
   not: (arg: any) => !arg,
   display: console.log,
   sleep: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
-  when: defineMacro(async (env, cond, ...body) => {
-    if (await eval_(env)(cond)) return begin(env, ...body);
+  when: macro((env, [cond, ...body], cont) => {
+    eval_(env, cond, (v) => (v ? begin(env, body, cont) : cont(undefined)));
   }),
-  while: defineMacro(async (env, cond, ...body) => {
-    while (await eval_(env)(cond)) {
-      await begin(env, ...body);
-    }
+  unless: macro((env, [cond, ...body], cont) => {
+    eval_(env, cond, (v) => (v ? cont(undefined) : begin(env, body, cont)));
   }),
-  if: defineMacro(async (env, cond, thenBranch, elseBranch) => {
-    if (await eval_(env)(cond)) {
-      return begin(env, thenBranch);
-    } else if (elseBranch !== undefined) {
-      return begin(env, elseBranch);
-    }
-  }),
-  dict: defineMacro((env, ...pairs) => {
-    if (pairs.length % 2 !== 0) throw new Error("dict requires even number of arguments");
-    return pairs.reduce(async (acc, cur, i) => {
-      return acc.then(async (obj) => {
-        if (i % 2 === 1) return obj;
-        const key = typeof cur === "symbol" && isKeyword(cur) ? getKeywordName(cur) : await eval_(env)(cur);
-        const value = await eval_(env)(pairs[i + 1]!);
-        if (key in obj) throw new Error(`Duplicate key '${key}' in dict`);
-        if (typeof key !== "string" && typeof key !== "number") throw new Error(`Invalid key type: ${typeof key}`);
-        return Object.assign(obj, { [key]: value });
+  while: macro(async (env, [cond, ...body], cont) => {
+    const loop = () => {
+      eval_(env, cond, (v) => {
+        if (!v) return cont(undefined);
+        begin(env, body, loop);
       });
-    }, Promise.resolve({}));
+    };
+    loop();
   }),
+  if: macro(async (env, [cond, thenBranch, elseBranch], cont) => {
+    eval_(env, cond, (v) => {
+      const branch = v ? thenBranch : elseBranch;
+      branch !== undefined ? begin(env, [branch], cont) : cont(undefined);
+    });
+  }),
+  // dict: defineMacro((env, ...pairs) => {
+  //   if (pairs.length % 2 !== 0) throw new Error("dict requires even number of arguments");
+  //   return pairs.reduce(async (acc, cur, i) => {
+  //     return acc.then(async (obj) => {
+  //       if (i % 2 === 1) return obj;
+  //       const key = typeof cur === "symbol" && isKeyword(cur) ? getKeywordName(cur) : await eval_(env)(cur);
+  //       const value = await eval_(env)(pairs[i + 1]!);
+  //       if (key in obj) throw new Error(`Duplicate key '${key}' in dict`);
+  //       if (typeof key !== "string" && typeof key !== "number") throw new Error(`Invalid key type: ${typeof key}`);
+  //       return Object.assign(obj, { [key]: value });
+  //     });
+  //   }, Promise.resolve({}));
+  // }),
   get: (target: any, ...path: string[]) => {
     const paths = _.toPath(path.join("."));
     if (paths.length === 0) return target;
@@ -208,16 +256,19 @@ const baseEnv = createEnv({
     if (paths.length === 0) return target;
     return _.set(target, paths, value);
   },
-  "set!": defineMacro(async (env, ...args) => {
-    const [value, key] = await Promise.all(args.map(eval_(env)));
-    let proto = env;
-    while (proto) {
-      if (Object.hasOwn(proto, key)) break;
-      proto = Object.getPrototypeOf(proto);
-    }
-    proto ??= env;
-    return _.set(proto, Symbol.for(key), value);
-  }),
+  // "set!": defineMacro((env, ...args) => {
+  //   const [value, key] = args.map(eval_(env));
+  //   let proto = env;
+  //   while (proto) {
+  //     if (Object.hasOwn(proto, key)) break;
+  //     proto = Object.getPrototypeOf(proto);
+  //   }
+  //   proto ??= env;
+  //   return _.set(proto, Symbol.for(key), value);
+  // }),
 });
 
-export const newEval = (env: Record<string, any> = {}) => eval_(Object.assign(Object.create(baseEnv), createEnv(env)));
+export const newEval = (env: Record<string, any> = {}) => {
+  const localEnv = Object.assign(Object.create(baseEnv), createEnv(env));
+  return (ast: AST) => eval_(localEnv, ast);
+};
