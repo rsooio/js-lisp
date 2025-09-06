@@ -1,5 +1,5 @@
 import { REST, TYPE } from "./const";
-import type { Arg, AST, Env, Eval, Proc } from "./type";
+import type { Arg, AST, Env, Eval, Proc, Promisable } from "./type";
 import * as _ from "es-toolkit/compat";
 
 function error(message: string) {
@@ -14,37 +14,41 @@ function getKeywordName(sym: symbol) {
   return sym.description!.slice(1);
 }
 
+function then<T, U>(v: Promisable<T>, k: (val: T) => Promisable<U>): Promisable<U> {
+  if (v instanceof Promise) return v.then(k);
+  // if (Array.isArray(v) && v.some((x) => x instanceof Promise)) return Promise.all(v).then(k);
+  return k(v);
+}
+
+function thenAll<T, U>(vs: Promisable<T>[], k: (vals: T[]) => Promisable<U>): Promisable<U> {
+  if (vs.some((v) => v instanceof Promise)) return Promise.all(vs).then(k);
+  return k(vs as T[]);
+}
+
 const eval_ =
   (env: Env = {}): Eval =>
-  async (ast) => {
+  (ast) => {
     if (typeof ast === "symbol") {
       if (isKeyword(ast)) throw new Error(`Keyword cannot be evaluate: ${ast.description}`);
       return ast in env ? env[ast] : error(`Undefined symbol: ${ast.description}`);
     }
     if (!Array.isArray(ast)) return ast;
     if (ast[0] === undefined) throw new Error("Unexpected empty list");
-    const proc = await eval_(env)(ast[0]);
-    if (typeof proc !== "function") throw new Error(`Not a function: ${proc}`);
-    if (TYPE in proc) return proc(env, ...ast.slice(1));
-    const args = await Promise.all(ast.slice(1).map(eval_(env)).map(wrap()));
-    console.log(proc, args, ast.slice(1));
-    return proc(...args);
-    // return first(...(await Promise.all(ast.slice(1).map(eval_(env)).map(wrap()))));
+    return then(eval_(env)(ast[0]), (proc) => {
+      if (typeof proc !== "function") throw new Error(`Not a function: ${proc}`);
+      if (TYPE in proc) return proc(env, ...ast.slice(1));
+      return thenAll(ast.slice(1).map(wrap(env)), (args) => proc(...args));
+    });
   };
 
 const wrap =
-  (argMap: Env = {}) =>
-  <T>(proc: T) => {
-    if (typeof proc !== "function" || !(TYPE in proc)) return proc;
-    argMap[TYPE] = "callback";
-    return async (...args: any[]) => {
-      try {
-        return await proc(argMap, ...args);
-      } catch (e) {
-        console.log("Error in callback:", e);
-      }
-    };
-  };
+  (env: Env, argMap: Env = {}) =>
+  (procAst: AST) =>
+    then(eval_(env)(procAst), (proc) => {
+      if (typeof proc !== "function" || !(TYPE in proc)) return proc;
+      argMap[TYPE] = "callback";
+      return (...args: any[]) => proc(argMap, ...args);
+    });
 
 const withTag =
   <Tag extends string>(tag: Tag) =>
@@ -56,51 +60,78 @@ const withTag =
 export const defineMacro = withTag("macro")<Proc>;
 
 const begin = defineMacro((env, ...body) =>
-  body.reduce(async (acc, cur) => acc.then(() => eval_(env)(cur)), Promise.resolve())
+  then(eval_(env)(body[0]), (v) => (body.length === 1 ? v : begin(env, ...body.slice(1))))
 );
 
-const lambda = defineMacro(async (env, argNames, ...body) => {
+const lambda = defineMacro((env, argNames, ...body) => {
   if (!Array.isArray(argNames)) throw new Error("Lambda arg names must be an array");
 
-  const parseArg = async (arg: AST): Promise<Arg> => {
+  const parseArg = (arg: AST): Promisable<Arg> => {
     if (typeof arg === "symbol") return [arg, undefined];
     if (!Array.isArray(arg)) throw new Error(`Unexpected type in arg define: ${typeof arg}`);
-    return [arg[0] as symbol, await eval_(env)(arg[1])];
+    // return [arg[0] as symbol, eval_(env)(arg[1])];
+    return then(eval_(env)(arg[1]), (v) => [arg[0] as symbol, v]);
   };
 
-  const parseArgs = async ([arg, ...rest]: AST[], args: Arg[] = [], map: Map<symbol, Arg> = new Map()) => {
+  const parseArgs = (
+    [arg, ...rest]: AST[],
+    args: Arg[] = [],
+    map: Map<symbol, Arg> = new Map()
+  ): Promisable<[Arg[], Map<symbol, Arg>]> => {
     if (arg === undefined) return [args, map] as const;
-    if (typeof arg !== "symbol" || !isKeyword(arg)) return parseArgs(rest, [...args, await parseArg(arg)], map);
+    if (typeof arg !== "symbol" || !isKeyword(arg))
+      return then(parseArg(arg), (parsed) => parseArgs(rest, [...args, parsed], map));
     if (map.has(arg)) throw new Error(`Duplicated keyword arguments: ${arg.description}`);
-    return parseArgs(rest.slice(1), args, map.set(arg, await parseArg(rest[0])));
+    return then(parseArg(rest[0]!), (parsed) => parseArgs(rest.slice(1), args, map.set(arg, parsed)));
   };
 
-  const [defArr, defMap] = await parseArgs(argNames);
+  return then(parseArgs(argNames), ([defArr, defMap]) => {
+    return withTag("proc")((callEnv: Env, ...args: AST[]) => {
+      const localEnv = Object.create(env);
+      const isCallback = callEnv[TYPE] === "callback";
+      const argMap = new Map<symbol, AST>();
 
-  return withTag("proc")(async (callEnv: Env, ...args: AST[]) => {
-    const localEnv = Object.create(env);
-    const isCallback = callEnv[TYPE] === "callback";
-    const argMap = new Map<symbol, AST>();
+      args.reverse();
+      const parseArg = (arr: [number, Arg][]): Promisable<void> => {
+        if (arr.length === 0) return;
+        const [[i, def], ...rest] = arr;
+        if (def[0] === REST) {
+          args.reverse();
+          if (isCallback) return void (localEnv[defArr[i + 1][0]] = args);
+          else return void thenAll(args.map(eval_(callEnv)), (vals) => (localEnv[defArr[i + 1][0]] = vals));
+        }
+        const arg = args.pop();
+        if (typeof arg === "symbol" && isKeyword(arg)) argMap.set(arg, args.pop()!);
+        else if (isCallback) localEnv[def[0]] = arg ?? def[1];
+        else
+          return then(eval_(callEnv)(arg!), (v) => {
+            if (v !== undefined) localEnv[def[0]] = v;
+            else if (def[1] !== undefined)
+              return then(eval_(callEnv)(def[1]), (v2) => ((localEnv[def[0]] = v2), parseArg(rest)));
+            return parseArg(rest);
+          });
+        return parseArg(rest);
+      };
 
-    args.reverse();
-    for (const [i, def] of defArr.entries()) {
-      if (def[0] === REST) {
-        args.reverse();
-        localEnv[defArr[i + 1][0]] = isCallback ? args : await Promise.all(args.map(eval_(callEnv)));
-        break;
-      }
-      const arg = args.pop();
-      if (typeof arg === "symbol" && isKeyword(arg)) argMap.set(arg, args.pop()!);
-      else if (isCallback) localEnv[def[0]] = arg ?? def[1];
-      else localEnv[def[0]] = (await eval_(callEnv)(arg!)) ?? (def[1] && (await eval_(callEnv)(def[1])));
-    }
+      const parseNamedArgs = (arr: [symbol, Arg][]): Promisable<void> => {
+        if (arr.length === 0) return;
+        const [[keyword, [key, val]], ...rest] = arr;
+        if (isCallback) localEnv[key] = callEnv[keyword] ?? val;
+        else if (!argMap.has(keyword)) localEnv[key] = val;
+        else
+          return then(eval_(callEnv)(argMap.get(keyword)!), (v) => {
+            localEnv[key] = v;
+            return parseNamedArgs(rest);
+          });
+        return parseNamedArgs(rest);
+      };
 
-    for (const [keyword, [key, val]] of defMap.entries()) {
-      if (isCallback) localEnv[key] = callEnv[keyword] ?? val;
-      else localEnv[key] = argMap.has(keyword) ? await eval_(callEnv)(argMap.get(keyword)!) : val;
-    }
-
-    return begin(localEnv, ...body);
+      return then(parseArg(Array.from(defArr.entries())), () => {
+        return then(parseNamedArgs(Array.from(defMap.entries())), () => {
+          return begin(localEnv, ...body);
+        });
+      });
+    });
   });
 });
 
