@@ -59,9 +59,9 @@ const withTag =
 
 export const defineMacro = withTag("macro")<Proc>;
 
-const begin = defineMacro((env, ...body) =>
-  then(eval_(env)(body[0]), (v) => (body.length === 1 ? v : begin(env, ...body.slice(1))))
-);
+const begin = defineMacro((env, ...body) => {
+  return then(eval_(env)(body[0]), (v) => (body.length === 1 ? v : begin(env, ...body.slice(1))));
+});
 
 const lambda = defineMacro((env, argNames, ...body) => {
   if (!Array.isArray(argNames)) throw new Error("Lambda arg names must be an array");
@@ -135,20 +135,31 @@ const lambda = defineMacro((env, argNames, ...body) => {
   });
 });
 
-const toCallback = defineMacro(async (env, procArg, ...args) => {
-  const map = { [TYPE]: "callback" as const } as Record<symbol, any>;
-  for (const [k, v] of _.chunk(args, 2)) {
-    map[k as symbol] = await eval_(env)(v);
-  }
-  return async (...args: any[]) => {
-    const proc = await eval_(env)(procArg);
-    if (typeof proc !== "function") throw new Error(`Not a function: ${proc}`);
-    try {
-      return TYPE in proc ? await proc(map, ...args) : await proc(...args);
-    } catch (e) {
-      console.log("Error in callback:", e);
+const toCallback = defineMacro((env, procArg, ...args) => {
+  return thenAll(
+    args.map((arg, i) => (i % 2 ? eval_(env)(arg) : arg)),
+    (vals) => {
+      const map = Object.fromEntries(_.chunk(vals, 2));
+      map[TYPE] = "callback";
+      return wrap(env, map)(procArg);
     }
-  };
+  );
+});
+
+const while_ = defineMacro((env, cond, ...body) => {
+  return then(eval_(env)(cond), (cond) => {
+    if (cond) return while_(env, cond, ...body);
+  });
+});
+
+const cond = defineMacro((env, ...clauses) => {
+  if (clauses.length === 0) return;
+  const [pred, ...body] = clauses[0] as AST[];
+  if (pred === Symbol.for("else")) return begin(env, ...body);
+  return then(eval_(env)(pred), (v) => {
+    if (v) return begin(env, ...body);
+    return cond(env, ...clauses.slice(1));
+  });
 });
 
 const createEnv = <const T extends Record<string, any>>(env: T): Env =>
@@ -162,22 +173,18 @@ const baseEnv = createEnv({
   quote: defineMacro((_, x) => x),
   car: (x: any[]) => x[0],
   cdr: (x: any[]) => x.slice(1),
-  cond: defineMacro(async (env, clauses) => {
-    for (const [cond, ...body] of clauses as AST[][]) {
-      if (cond === Symbol.for("else") || (await eval_(env)(cond!))) return begin(env, ...body);
-    }
-  }),
-  eval: defineMacro(async (env: Env, ast: AST) => eval_(env)(await eval_(env)(ast))),
+  cond,
+  eval: defineMacro((env, ast) => then(eval_(env)(ast), eval_(env))),
   begin,
   lambda,
   λ: lambda,
   function: toCallback,
-  define: defineMacro(async (env, names, ...body) => {
+  define: defineMacro((env, names, ...body) => {
     if (!Array.isArray(names)) {
-      env[names as symbol] = await eval_(env)(body[0]!);
+      then(eval_(env)(body[0]!), (v) => (env[names as symbol] = v));
     } else {
       const [name, ...argNames] = names as symbol[];
-      env[name!] = lambda(env, argNames, ...body);
+      then(lambda(env, argNames, ...body), (v) => (env[name] = v));
     }
   }),
   list: Array.of,
@@ -199,33 +206,29 @@ const baseEnv = createEnv({
   not: (arg: any) => !arg,
   display: console.log,
   sleep: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
-  when: defineMacro(async (env, cond, ...body) => {
-    if (await eval_(env)(cond)) return begin(env, ...body);
+  when: defineMacro((env, cond, ...body) => {
+    return then(eval_(env)(cond), (cond) => {
+      if (cond) return begin(env, ...body);
+    });
   }),
-  while: defineMacro(async (env, cond, ...body) => {
-    while (await eval_(env)(cond)) {
-      await begin(env, ...body);
-    }
+  unless: defineMacro((env, cond, ...body) => {
+    return then(eval_(env)(cond), (cond) => {
+      if (!cond) return begin(env, ...body);
+    });
   }),
-  if: defineMacro(async (env, cond, thenBranch, elseBranch) => {
-    if (await eval_(env)(cond)) {
-      return begin(env, thenBranch);
-    } else if (elseBranch !== undefined) {
-      return begin(env, elseBranch);
-    }
+  while: while_,
+  if: defineMacro((env, cond, thenBranch, elseBranch) => {
+    return then(eval_(env)(cond), (cond) => {
+      if (cond) return begin(env, thenBranch);
+      else if (elseBranch !== undefined) return begin(env, elseBranch);
+    });
   }),
   dict: defineMacro((env, ...pairs) => {
     if (pairs.length % 2 !== 0) throw new Error("dict requires even number of arguments");
-    return pairs.reduce(async (acc, cur, i) => {
-      return acc.then(async (obj) => {
-        if (i % 2 === 1) return obj;
-        const key = typeof cur === "symbol" && isKeyword(cur) ? getKeywordName(cur) : await eval_(env)(cur);
-        const value = await eval_(env)(pairs[i + 1]!);
-        if (key in obj) throw new Error(`Duplicate key '${key}' in dict`);
-        if (typeof key !== "string" && typeof key !== "number") throw new Error(`Invalid key type: ${typeof key}`);
-        return Object.assign(obj, { [key]: value });
-      });
-    }, Promise.resolve({}));
+    return thenAll(
+      pairs.map((p, i) => (i % 2 === 1 || typeof p !== "symbol" || !isKeyword(p) ? eval_(env)(p) : getKeywordName(p))),
+      (vals) => Object.fromEntries(_.chunk(vals, 2))
+    );
   }),
   get: (target: any, ...path: string[]) => {
     const paths = _.toPath(path.join("."));
@@ -239,15 +242,16 @@ const baseEnv = createEnv({
     if (paths.length === 0) return target;
     return _.set(target, paths, value);
   },
-  "set!": defineMacro(async (env, ...args) => {
-    const [value, key] = await Promise.all(args.map(eval_(env)));
-    let proto = env;
-    while (proto) {
-      if (Object.hasOwn(proto, key)) break;
-      proto = Object.getPrototypeOf(proto);
-    }
-    proto ??= env;
-    return _.set(proto, Symbol.for(key), value);
+  "set!": defineMacro((env, ...args) => {
+    return thenAll(args.map(eval_(env)), ([value, key]) => {
+      let proto = env;
+      while (proto) {
+        if (Object.hasOwn(proto, key)) break;
+        proto = Object.getPrototypeOf(proto);
+      }
+      proto ??= env;
+      return _.set(proto, Symbol.for(key), value);
+    });
   }),
 });
 
