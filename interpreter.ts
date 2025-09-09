@@ -1,4 +1,5 @@
 import { REST, TYPE } from "./const";
+import { parse } from "./parser";
 import type { Arg, AST, Env, Eval, Proc, Promisable } from "./type";
 import * as _ from "es-toolkit/compat";
 
@@ -16,7 +17,6 @@ function getKeywordName(sym: symbol) {
 
 function then<T, U>(v: Promisable<T>, k: (val: T) => Promisable<U>): Promisable<U> {
   if (v instanceof Promise) return v.then(k);
-  // if (Array.isArray(v) && v.some((x) => x instanceof Promise)) return Promise.all(v).then(k);
   return k(v);
 }
 
@@ -28,6 +28,7 @@ function thenAll<T, U>(vs: Promisable<T>[], k: (vals: T[]) => Promisable<U>): Pr
 const eval_ =
   (env: Env = {}): Eval =>
   (ast) => {
+    if (env[TYPE] === "shutdown") throw new Error("Environment is shutdown");
     if (typeof ast === "symbol") {
       if (isKeyword(ast)) throw new Error(`Keyword cannot be evaluate: ${ast.description}`);
       return ast in env ? env[ast] : error(`Undefined symbol: ${ast.description}`);
@@ -47,7 +48,14 @@ const wrap =
     then(eval_(env)(procAst), (proc) => {
       if (typeof proc !== "function" || !(TYPE in proc)) return proc;
       argMap[TYPE] = "callback";
-      return (...args: any[]) => proc(argMap, ...args);
+      return (...args: any[]) => {
+        try {
+          const result = proc(env, ...args);
+          return result instanceof Promise ? result.catch(console.error) : result;
+        } catch (e) {
+          console.error(e);
+        }
+      };
     });
 
 const withTag =
@@ -146,9 +154,12 @@ const toCallback = defineMacro((env, procArg, ...args) => {
   );
 });
 
-const while_ = defineMacro((env, cond, ...body) => {
-  return then(eval_(env)(cond), (cond) => {
-    if (cond) return while_(env, cond, ...body);
+const while_ = defineMacro((env, pred, ...body) => {
+  return then(eval_(env)(pred), (cond) => {
+    if (!cond) return;
+    return then(begin(env, ...body), () => {
+      return while_(env, pred, ...body);
+    });
   });
 });
 
@@ -166,9 +177,16 @@ const createEnv = <const T extends Record<string, any>>(env: T): Env =>
   Object.fromEntries(Object.entries(env).map(([k, v]) => [Symbol.for(k), v]));
 
 const baseEnv = createEnv({
-  JS: { String, Number, Array, Boolean, Math, Date, RegExp },
+  JS: { URL, String, Number, Array, Boolean, Math, Date, RegExp, setTimeout, clearTimeout },
+  throw: (message: string) => {
+    throw new Error(message);
+  },
+  new: (cls: any, ...args: any[]) => new cls(...args),
   "#t": true,
   "#f": false,
+  "symbol->string": (sym: symbol) => sym.description,
+  "string->symbol": (str: string) => Symbol.for(str),
+  "is-symbol?": (x: any) => typeof x === "symbol",
   null: [],
   quote: defineMacro((_, x) => x),
   car: (x: any[]) => x[0],
@@ -181,16 +199,22 @@ const baseEnv = createEnv({
   function: toCallback,
   define: defineMacro((env, names, ...body) => {
     if (!Array.isArray(names)) {
-      then(eval_(env)(body[0]!), (v) => (env[names as symbol] = v));
+      return then(eval_(env)(body[0]!), (v) => (env[names as symbol] = v));
     } else {
       const [name, ...argNames] = names as symbol[];
-      then(lambda(env, argNames, ...body), (v) => (env[name] = v));
+      return then(lambda(env, argNames, ...body), (v) => (env[name] = v));
     }
   }),
+  macro: defineMacro((_, ...body) =>
+    defineMacro((callEnv, ...args) => {
+      const env = Object.create(callEnv);
+      env[Symbol.for("&body")] = args;
+      return begin(env, ...body);
+    })
+  ),
   list: Array.of,
   cons: (x: any, y: any) => [x, ...y],
   "null?": (x: any) => Array.isArray(x) && x.length === 0,
-  call: (fn: any, ...args: any[]) => fn?.(...args),
   "+": (...args: number[]) => args.reduce((prev, curr) => +prev + +curr, 0),
   "-": (...args: number[]) => args.reduce((prev, curr) => +prev - +curr),
   "*": (...args: number[]) => args.reduce((prev, curr) => +prev * +curr, 1),
@@ -237,22 +261,66 @@ const baseEnv = createEnv({
     if (typeof result !== "function") return result;
     return result.bind(paths.length > 1 ? _.get(target, paths.slice(0, -1)) : target);
   },
-  set: (target: any, value: any, ...path: string[]) => {
-    const paths = _.toPath(path.join("."));
+  set: (target: any, ...args: any[]) => {
+    const value = args.pop();
+    const paths = _.toPath(args.join("."));
     if (paths.length === 0) return target;
     return _.set(target, paths, value);
   },
-  "set!": defineMacro((env, ...args) => {
-    return thenAll(args.map(eval_(env)), ([value, key]) => {
+  "set!": defineMacro((env, key, value) => {
+    if (typeof key !== "symbol") throw new Error("set! requires a symbol as the second argument");
+    return then(eval_(env)(value), (value) => {
       let proto = env;
       while (proto) {
         if (Object.hasOwn(proto, key)) break;
         proto = Object.getPrototypeOf(proto);
       }
       proto ??= env;
-      return _.set(proto, Symbol.for(key), value);
+      return _.set(proto, key, value);
     });
   }),
 });
 
-export const newEval = (env: Record<string, any> = {}) => eval_(Object.assign(Object.create(baseEnv), createEnv(env)));
+export class Environment {
+  private env: Env;
+
+  constructor(env: Record<string, any> = {}) {
+    this.env = Object.assign(Object.create(baseEnv), createEnv(env));
+  }
+
+  public eval(code: string) {
+    const asts = parse(code);
+    return asts
+      .reduce(async (acc, cur) => acc.then(() => eval_(this.env)(cur)), Promise.resolve())
+      .catch(console.error);
+  }
+
+  public call(func: string, ...args: any[]) {
+    return this.eval(`(function ${func})`).then((fn) => fn(...args));
+  }
+
+  public set(name: string, value: any) {
+    const key = Symbol.for(name);
+    if (key in this.env) {
+      console.warn(`Warning: variable ${name} is being overwritten`);
+    }
+    this.env[key] = value;
+  }
+
+  public get(name: string) {
+    return this.env[Symbol.for(name)];
+  }
+
+  public del(name: string) {
+    const key = Symbol.for(name);
+    if (key in this.env) {
+      delete this.env[key];
+    } else {
+      console.warn(`Warning: variable ${name} does not exist`);
+    }
+  }
+
+  public shutdown() {
+    this.env[TYPE] = "shutdown";
+  }
+}

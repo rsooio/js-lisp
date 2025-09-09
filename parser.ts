@@ -9,7 +9,7 @@ const tokenize = (input: string) =>
     .match(/[()\[\]]|'|"(?:\\.|[^"\\])*"|[^\s()\[\]]+/g) || [];
 
 const parseAtom = (token: string) => {
-  if (/^\d+$/.test(token)) return parseInt(token, 10);
+  if (!isNaN(Number(token))) return Number(token);
   if (/^".*"$/s.test(token)) return JSON.parse(token.replaceAll("\n", "\\n"));
   if (!token.includes(".") || token === REST.description) return Symbol.for(token);
   const index = token.indexOf(".");
